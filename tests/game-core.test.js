@@ -1,6 +1,6 @@
 (() => {
   'use strict';
-  const { Game, coverage, cellKey } = window.SilkGame;
+  const { Game, coverage, cellKey, WAVES, LEVELS, ENEMIES, DIFFICULTIES } = window.SilkGame;
   const results = [];
   function assert(condition, message) { if (!condition) throw new Error(message); }
   function test(name, run) {
@@ -89,20 +89,23 @@
     assert(!g.nextWave('heart'), 'Cannot revive through upgrade after loss');
   });
 
-  test('Upgrades apply once; five completed waves lead to victory', () => {
+  test('Upgrades apply once; all twelve completed levels lead to victory', () => {
     const g = fixture();
-    for (let wave = 1; wave <= 5; wave++) {
+    for (let wave = 1; wave <= WAVES; wave++) {
       assert(g.state.wave === wave, 'Wave order');
+      g.state.blocked = [];
       g.state.flies = [{ id: 'target', r: 0, c: 0, ttl: 2 }];
       g.place('thread', 0, 0); g.resolve();
       const status = g.advance();
-      if (wave < 5) {
+      if (wave < WAVES) {
         assert(status === 'waveComplete', 'Upgrade phase');
         const oldSilk = g.state.maxSilk;
-        assert(g.nextWave('silk'), 'Advance');
-        assert(g.state.maxSilk === oldSilk + 1 && g.state.silk === oldSilk + 1, 'Permanent silk');
-        assert(!g.nextWave('silk') && g.state.maxSilk === oldSilk + 1, 'No duplicate upgrade');
-      } else assert(status === 'won', 'Victory on wave five');
+        const choice = g.upgrades().find(u => !u.disabled).id;
+        assert(g.nextWave(choice), 'Advance');
+        const expectedSilk = Math.min(10, oldSilk + (choice === 'silk' ? 1 : 0) + ([5, 9].includes(wave + 1) ? 1 : 0));
+        assert(g.state.maxSilk === expectedSilk && g.state.silk === expectedSilk, 'Permanent silk');
+        assert(!g.nextWave(choice) && g.state.maxSilk === expectedSilk, 'No duplicate upgrade');
+      } else assert(status === 'won', 'Victory on level twelve');
     }
   });
 
@@ -128,13 +131,132 @@
         g.resolve(); g.advance();
         for (const fly of g.state.flies) {
           const old = before.find(f => f.id === fly.id);
-          assert(Math.abs(fly.r - old.r) + Math.abs(fly.c - old.c) <= 1, 'A fly moved too far');
-          assert(fly.r >= 0 && fly.r < 4 && fly.c >= 0 && fly.c < 6, 'A fly left the field');
+          assert(Math.abs(fly.r - old.r) + Math.abs(fly.c - old.c) <= ENEMIES[fly.kind || 'ordinary'].speed, 'A fly moved too far');
+          assert(fly.r >= 0 && fly.r < g.state.rows && fly.c >= 0 && fly.c < g.state.cols, 'A fly left the field');
           assert(fly.ttl === old.ttl - 1, 'Approach counter');
         }
-        assert(new Set(g.state.flies.map(f => cellKey(f.r, f.c))).size === g.state.flies.length, 'Flies collided');
+        assert(new Set(g.state.flies.map(f => g.key(f.r, f.c))).size === g.state.flies.length, 'Flies collided');
       }
     }
+  });
+
+  test('All 60 difficulty/level combinations generate a valid roster and free starting cells', () => {
+    for (const difficulty of Object.keys(DIFFICULTIES)) for (let level = 1; level <= WAVES; level++) {
+      const g = new Game(difficulty, seeded(level)); g.state.wave = level; g.beginWave();
+      const s = g.state;
+      assert(s.flies.length === LEVELS[level - 1].flies + DIFFICULTIES[difficulty].extraFlies, 'Roster size');
+      assert(s.flies.every(f => f.hp === ENEMIES[f.kind].hp && !s.blocked.includes(g.key(f.r, f.c))), 'Free starting cell and correct armor');
+      assert(new Set(s.flies.map(f => g.key(f.r, f.c))).size === s.flies.length, 'Unique flies');
+      assert(new Set(s.blocked).size === (LEVELS[level - 1].leaves || 0), 'Unique leaves');
+    }
+  });
+  test('Armor hit on the last approach turn stuns and exposes without costing a life', () => {
+    const g = fixture(); g.state.wave = 6;
+    g.state.flies = [{ id: 'armor', kind: 'armored', hp: 2, r: 1, c: 1, ttl: 1 }];
+    g.place('thread', 1, 1);
+    const first = g.resolve();
+    assert(first.wounded.length === 1 && !first.caught.length && g.state.health === 3, 'Armor absorbs first hit');
+    g.advance();
+    const f = g.state.flies[0];
+    assert(f.r === 1 && f.c === 1 && f.ttl === 1 && f.hp === 1 && f.stunned, 'Stun must preserve position and approach');
+    g.place('thread', 1, 1); const second = g.resolve();
+    assert(second.caught.length === 1 && g.advance() === 'waveComplete', 'Second hit catches armor');
+  });
+  test('Rosinka stops approach and movement once, then normal movement resumes', () => {
+    const g = fixture(); assert(!g.freeze().ok, 'Locked before level four');
+    g.state.wave = 4; g.beginWave();
+    g.state.flies.forEach(f => { f.ttl = 1; });
+    const before = g.state.flies.map(f => ({ ...f }));
+    assert(g.freeze().ok && !g.freeze().ok, 'One charge per cast');
+    assert(g.state.silk === 3, 'Freeze cost');
+    g.resolve(); g.advance();
+    assert(g.state.flies.every((f,i) => f.r === before[i].r && f.c === before[i].c && f.ttl === 1), 'Entire flock frozen');
+    assert(!g.state.frozen && g.state.freezeLeft === 0, 'Freeze ends and charge stays spent');
+    assert(g.resolve().escaped.length === before.length, 'Approach resumes next check');
+  });
+  test('Fog never leaks counts through noise but radar still works', () => {
+    const g = fixture(); g.state.wave = 7; g.beginWave();
+    g.state.flies = [{r:0,c:0,ttl:3}, {r:1,c:0,ttl:3}, {r:2,c:0,ttl:3}];
+    assert(g.noise()[0] === 1 && g.noise()[1] === 0, 'Binary clues in fog');
+    assert(g.scan().ok && g.state.scanned, 'Radar bypasses fog');
+  });
+  test('Leaves block every covered cell and rejection does not spend silk', () => {
+    const g = fixture(); g.state.wave = 8; g.state.blocked = [cellKey(1, 2)];
+    for (const type of ['thread','cross','cocoon','ribbon','blossom']) {
+      assert(!g.place(type,1,2).ok && g.state.silk === 5, 'No placement through leaf');
+    }
+    assert(!g.place('cross',1,1).ok && !g.place('ribbon',1,0).ok, 'Leaf on any arm blocks full trap');
+    assert(g.place('thread',0,0).ok, 'Free cells remain usable');
+  });
+  test('Ribbon covers exactly one row; blossom clips and deals two damage', () => {
+    assert(coverage('ribbon',2,4).length === 6 && coverage('ribbon',2,4).every(([r]) => r === 2), 'Whole row');
+    assert(coverage('blossom',0,0).length === 4 && coverage('blossom',1,1).length === 9, 'Flower bounds');
+    const g = fixture(); g.state.wave = 12;
+    g.state.flies = [{ id:'queen', kind:'queen', hp:3, r:1,c:1,ttl:1 }, { id:'armor', kind:'armored', hp:2, r:0,c:0,ttl:1 }];
+    g.place('blossom',1,1); const report = g.resolve();
+    assert(report.caught.length === 1 && report.wounded[0].hp === 1, 'Flower defeats armor, wounds queen');
+    g.advance(); g.place('thread',1,1); g.resolve();
+    assert(g.advance() === 'won', 'Queen can be finished on last approach turn');
+  });
+  test('Queen escape deals two lives and upgrades never soft-lock capped builds', () => {
+    const g = fixture(); g.state.wave = 12;
+    g.state.flies = [{kind:'queen',hp:3,r:0,c:0,ttl:1}];
+    assert(g.resolve().damage === 2 && g.state.health === 1, 'Queen deals two');
+    Object.assign(g.state, {wave:11,status:'waveComplete',maxSilk:10,radarCapacity:3,health:5,maxTraps:5,freezeCapacity:2});
+    assert(g.upgrades().some(u => u.id === 'rest' && !u.disabled), 'Fallback upgrade');
+    assert(g.nextWave('rest') && g.state.wave === 12, 'Capped player can continue');
+  });
+  test('Gusts add one bounded step and never merge flies', () => {
+    for (let seed=1; seed<=40; seed++) {
+      const g=new Game('normal',seeded(seed)); g.state.wave=10; g.beginWave();
+      const before=g.state.flies.map(f=>({...f})); g.resolve(); g.advance();
+      g.state.flies.forEach((f,i)=>assert(Math.abs(f.r-before[i].r)+Math.abs(f.c-before[i].c)<=ENEMIES[f.kind].speed+1,'Gust distance'));
+      assert(new Set(g.state.flies.map(f=>g.key(f.r,f.c))).size===g.state.flies.length,'No collisions');
+    }
+  });
+  test('Boards grow at chapter boundaries and reset to the small garden on restart', () => {
+    const g = fixture();
+    for (let level = 1; level <= WAVES; level++) {
+      g.state.wave = level; g.beginWave();
+      const { rows, cols } = g.state;
+      assert(cols === (level < 5 ? 6 : level < 9 ? 7 : 8), 'Column count');
+      assert(rows === (level < 5 ? 4 : level < 9 ? 5 : 6), 'Row count');
+      assert(g.noise().length === cols, 'One clue per column');
+      assert(g.state.flies.every(f => f.r < rows && f.c < cols), 'Spawns within resized field');
+      assert(new Set(Array.from({ length: rows * cols }, (_, i) => g.key(Math.floor(i / cols), i % cols))).size === rows * cols, 'Every tile has a unique key');
+    }
+    g.start('easy');
+    assert(g.state.rows === 4 && g.state.cols === 6 && g.state.wave === 1, 'Restart shrinks both fields');
+  });
+  test('Traps reach the far edge of enlarged fields and preserve border rules', () => {
+    const g = fixture(); g.state.wave = 9; g.beginWave(); g.state.blocked = [];
+    assert(g.coverage('ribbon', 5, 7).length === 8, 'Ribbon spans all eight columns');
+    assert(g.coverage('cross', 5, 7).length === 3, 'Corner cross clips to three');
+    assert(g.coverage('blossom', 5, 7).length === 4, 'Corner flower clips to four');
+    assert(!g.place('cocoon', 5, 7).ok && !g.place('thread', 6, 7).ok, 'Out-of-bounds traps rejected');
+    g.state.flies = [{ id: 'edge', kind: 'ordinary', hp: 1, r: 5, c: 7, ttl: 1 }];
+    assert(g.place('ribbon', 5, 2).ok && g.trapAt(5, 7).type === 'ribbon', 'Far edge covered');
+    assert(g.resolve().caught.length === 1 && g.advance() === 'waveComplete', 'Capture at H6');
+  });
+  test('Growing the garden grants a capped permanent bonus exactly once', () => {
+    for (const boundary of [4, 8]) {
+      const g = fixture();
+      Object.assign(g.state, { wave: boundary, status: 'waveComplete', maxSilk: 6 });
+      assert(g.nextWave('radar') && g.state.maxSilk === 7 && g.state.silk === 7, 'Growth bonus');
+      assert(!g.nextWave('radar') && g.state.maxSilk === 7, 'Cannot apply bonus twice');
+      g.state.status = 'waveComplete'; g.nextWave('heart');
+      assert(g.state.maxSilk === 7, 'No bonus between chapter boundaries');
+    }
+    const capped = fixture(); Object.assign(capped.state, {wave: 8, status: 'waveComplete', maxSilk: 10});
+    capped.nextWave('radar');
+    assert(capped.state.maxSilk === 10, 'Silk cap survives growth');
+  });
+  test('Late-game leaf collision uses the enlarged coordinate system', () => {
+    const g = fixture(); g.state.wave = 9; g.beginWave(); g.state.blocked = [g.key(5, 7)];
+    assert(!g.place('ribbon', 5, 0).ok && !g.place('blossom', 4, 6).ok, 'Any part touching H6 is blocked');
+    assert(g.place('thread', 5, 6).ok, 'Adjacent G6 remains free');
+    g.clearNew();
+    assert(g.state.silk === g.state.maxSilk, 'Rejected traps do not consume silk');
   });
   window.__testResults = results;
 })();
